@@ -8,6 +8,7 @@ RM := rm -rf
 
 # All of the sources participating in the build are defined here
 -include sources.mk
+-include src/Debug/subdir.mk
 -include src/subdir.mk
 -include subdir.mk
 -include objects.mk
@@ -25,29 +26,29 @@ endif
 
 # Add inputs and outputs from these tool invocations to the build variables 
 ELFSIZE += \
-spectre_attack_main.elf.size \
+spectre-arm7.elf.size \
 
 
 # All Target
-all: spectre_attack_main.elf secondary-outputs
+all: spectre-arm7.elf secondary-outputs
 
 # Tool invocations
-spectre_attack_main.elf: $(OBJS)  $(USER_OBJS)
+spectre-arm7.elf: $(OBJS)  $(USER_OBJS)
 	@echo 'Building target: $@'
 	@echo 'Invoking: ARM v7 Linux gcc linker'
-	arm-linux-gnueabihf-gcc -L"C:\XilinxProjects\SpectreAttackResearchProject\SpectreAttackMain\Debug\armageddon\libflush\build\armv7\release" -o "spectre_attack_main.elf" $(OBJS) $(USER_OBJS) $(LIBS)
+	arm-linux-gnueabihf-gcc -L"C:\XilinxProjects\SpectreAttackResearchProject\SpectreAttackMain\Debug\armageddon\libflush\build\armv7\release" -o "spectre-arm7.elf" $(OBJS) $(USER_OBJS) $(LIBS)
 	@echo 'Finished building target: $@'
 	@echo ' '
 
-spectre_attack_main.elf.size: spectre_attack_main.elf
+spectre-arm7.elf.size: spectre-arm7.elf
 	@echo 'Invoking: ARM v7 Linux Print Size'
-	arm-linux-gnueabihf-size spectre_attack_main.elf  |tee "spectre_attack_main.elf.size"
+	arm-linux-gnueabihf-size spectre-arm7.elf  |tee "spectre-arm7.elf.size"
 	@echo 'Finished building: $@'
 	@echo ' '
 
 # Other Targets
 clean:
-	-$(RM) $(EXECUTABLES)$(OBJS)$(S_UPPER_DEPS)$(C_DEPS)$(ELFSIZE) spectre_attack_main.elf
+	-$(RM) $(EXECUTABLES)$(OBJS)$(S_UPPER_DEPS)$(C_DEPS)$(ELFSIZE) spectre-arm7.elf
 	-@echo ' '
 
 secondary-outputs: $(ELFSIZE)
